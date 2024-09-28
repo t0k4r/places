@@ -4,23 +4,21 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/url"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
-	_ "embed"
-
-	_ "github.com/glebarez/go-sqlite"
 	"github.com/t0k4r/places"
+	_ "modernc.org/sqlite"
 )
 
-//go:embed schema.sql
-var schema string
+var schema string = `
+CREATE TABLE IF NOT EXISTS places (
+	"query" TEXT,
+    "json" TEXT
+)
+`
 
 var mut sync.Mutex = sync.Mutex{}
 
@@ -33,175 +31,127 @@ func unlock() {
 	mut.Unlock()
 }
 
-type Client struct {
+type apiResp struct {
+	Lat         float64 `json:"lat,string"`
+	Lon         float64 `json:"lon,string"`
+	AddressType string  `json:"addresstype"`
+	DisplayName string  `json:"display_name"`
+	Address     struct {
+		Neighbourhood string `json:"neighbourhood"`
+		Suburb        string `json:"suburb"`
+		Village       string `json:"village"`
+		Town          string `json:"town"`
+		City          string `json:"city"`
+		Municipality  string `json:"municipality"`
+		County        string `json:"county"`
+		State         string `json:"state"`
+		Country       string `json:"country"`
+	} `json:"address"`
+}
+
+func (resp *apiResp) placeType() places.PlaceType {
+	switch resp.AddressType {
+	case "neighbourhood":
+		return places.Neighbourhood
+	case "suburb":
+		return places.Suburb
+	case "city":
+		return places.City
+	case "village":
+		return places.Village
+	case "town":
+		return places.Town
+	case "municipality":
+		return places.Municipality
+	case "county":
+		return places.County
+	case "state":
+		return places.State
+	case "country":
+		return places.Country
+	}
+	return places.Other
+}
+
+type client struct {
 	userAgent string
 	db        *sql.DB
 }
 
-type netResp struct {
-	DisplayName string `json:"display_name"`
-	Lat         string `json:"lat"`
-	Long        string `json:"lon"`
+func New(userAgent string) (f places.Finder, err error) {
+	c := client{userAgent: userAgent}
+	c.db, err = sql.Open("sqlite", "nominatium.sqlite")
+	if err != nil {
+		return &c, err
+	}
+	_, err = c.db.Exec(schema)
+	return &c, err
 }
-
-func NewClient(userAgent string) (places.PlaceFinder, error) {
-	client := &Client{userAgent: userAgent}
-	var err error
-	client.db, err = sql.Open("sqlite", "nominatium.sqlite")
-	if err != nil {
-		return client, err
+func (c *client) Find(name string) (results []places.Place, err error) {
+	results, err = dbQuery(c.db, name)
+	if len(results) != 0 || err != nil {
+		return results, err
 	}
-	for _, table := range strings.Split(schema, ";") {
-		_, err := client.db.Exec(table)
-		if err != nil {
-			return client, err
-		}
-	}
-	return client, nil
-}
-
-func (c *Client) FromName(name string) ([]places.Place, error) {
-	places, err := c.dbFromName(name)
-	if err != nil {
-		slog.Warn(err.Error())
-	} else if len(places) != 0 {
-		return places, err
-	}
-	places, err = c.netFromName(name)
-	return places, err
-}
-
-func (c *Client) readNetRespMany(body io.Reader, query string) ([]places.Place, error) {
-	var jarr []netResp
-	err := json.NewDecoder(body).Decode(&jarr)
-	if err != nil {
-		return nil, err
-	}
-	var plcs []places.Place
-	for _, j := range jarr {
-		ll := places.LatLong{}
-		ll.Lat, err = strconv.ParseFloat(j.Lat, 64)
-		if err != nil {
-			return plcs, err
-		}
-		ll.Long, err = strconv.ParseFloat(j.Long, 64)
-		if err != nil {
-			return plcs, err
-		}
-		plc := places.Place{
-			LatLong: ll,
-			Name:    j.DisplayName,
-		}
-		plcs = append(plcs, plc)
-		c.dbInsert(query, plc)
-	}
-	return plcs, nil
-}
-
-func (c *Client) readNetRespOne(body io.Reader, query string) ([]places.Place, error) {
-	var jarr netResp
-	err := json.NewDecoder(body).Decode(&jarr)
-	if err != nil {
-		return nil, err
-	}
-
-	ll := places.LatLong{}
-	ll.Lat, err = strconv.ParseFloat(jarr.Lat, 64)
-	if err != nil {
-		return nil, err
-	}
-	ll.Long, err = strconv.ParseFloat(jarr.Long, 64)
-	if err != nil {
-		return nil, err
-	}
-	plc := places.Place{
-		LatLong: ll,
-		Name:    jarr.DisplayName,
-	}
-	c.dbInsert(query, plc)
-
-	return []places.Place{plc}, nil
-}
-
-func (c *Client) netFromName(name string) ([]places.Place, error) {
 	lock()
 	defer unlock()
 
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://nominatim.openstreetmap.org/search.php?q=%v&format=jsonv2", url.QueryEscape(name)), nil)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://nominatim.openstreetmap.org/search.php?q=%v&format=jsonv2&addressdetails=1", url.QueryEscape(name)), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", c.userAgent)
-	resp, err := http.DefaultClient.Do(req)
+	r, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return nil, err
+		return results, err
 	}
-
-	return c.readNetRespMany(resp.Body, name)
+	var resps []apiResp
+	err = json.NewDecoder(r.Body).Decode(&resps)
+	if err != nil {
+		return results, err
+	}
+	for _, resp := range resps {
+		result := places.Place{
+			Type:          resp.placeType(),
+			Lat:           resp.Lat,
+			Lon:           resp.Lon,
+			Name:          resp.DisplayName,
+			Neighbourhood: resp.Address.Neighbourhood,
+			Suburb:        resp.Address.Suburb,
+			City:          resp.Address.City,
+			Town:          resp.Address.Town,
+			Village:       resp.Address.Village,
+			Municipality:  resp.Address.Municipality,
+			County:        resp.Address.County,
+			State:         resp.Address.State,
+			Country:       resp.Address.Country,
+		}
+		results = append(results, result)
+	}
+	return results, nil
 }
-
-func (c *Client) dbInsert(query string, place places.Place) error {
-	_, err := c.db.Exec(`insert into places("query", name, lat, long) values ($1, $2, $3, $4)`, query, place.Name, place.Lat, place.Long)
+func dbQuery(db *sql.DB, query string) (results []places.Place, err error) {
+	rows, err := db.Query("select * from places where query=$1", query)
+	if err != nil {
+		return results, err
+	}
+	for rows.Next() {
+		var result places.Place
+		var j string
+		if err := rows.Scan(&j); err != nil {
+			return results, nil
+		}
+		if err = json.Unmarshal([]byte(j), &result); err != nil {
+			return results, nil
+		}
+		results = append(results, result)
+	}
+	return results, nil
+}
+func dbInsert(db *sql.DB, query string, resp apiResp) error {
+	b, err := json.Marshal(resp)
+	if err != nil {
+		return err
+	}
+	_, err = db.Exec("insert into places(query, json) values ($1, $2)", query, string(b))
 	return err
-}
-
-func (c *Client) dbFromName(name string) ([]places.Place, error) {
-	var plcs []places.Place
-	rows, err := c.db.Query("select distinct name, lat, long from places where name = $1 or query = $1", name)
-	if err != nil {
-		return plcs, err
-	}
-	for rows.Next() {
-		var plc places.Place
-		err = rows.Scan(&plc.Name, &plc.Lat, &plc.Long)
-		if err != nil {
-			return plcs, err
-		}
-		plcs = append(plcs, plc)
-	}
-	return plcs, nil
-}
-
-func (c *Client) FromLatLong(latLong places.LatLong) ([]places.Place, error) {
-	places, err := c.dbFromLatLong(latLong)
-	if err != nil {
-		slog.Warn(err.Error())
-	} else if len(places) != 0 {
-		return places, err
-	}
-	places, err = c.netFromLatLong(latLong)
-	return places, err
-}
-
-func (c *Client) netFromLatLong(latLong places.LatLong) ([]places.Place, error) {
-	lock()
-	defer unlock()
-
-	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("https://nominatim.openstreetmap.org/reverse.php?lat=%v&lon=%v&format=jsonv2", latLong.Lat, latLong.Long), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("User-Agent", c.userAgent)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-
-	return c.readNetRespOne(resp.Body, "")
-}
-func (c *Client) dbFromLatLong(latLong places.LatLong) ([]places.Place, error) {
-	var plcs []places.Place
-	rows, err := c.db.Query("select distinct name, lat, long  from places where lat = $1 and long = $2", latLong.Lat, latLong.Long)
-	if err != nil {
-		return plcs, err
-	}
-	for rows.Next() {
-		var plc places.Place
-		err = rows.Scan(&plc.Name, &plc.Lat, &plc.Long)
-		if err != nil {
-			return plcs, err
-		}
-		plcs = append(plcs, plc)
-	}
-	return plcs, nil
 }

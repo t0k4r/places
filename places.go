@@ -1,16 +1,36 @@
 package places
 
-type LatLong struct {
-	Lat  float64
-	Long float64
-}
+type PlaceType string
+
+const (
+	Other         PlaceType = "other"
+	Neighbourhood           = "neighbourhood"
+	Suburb                  = "suburb"
+	City                    = "city"
+	Town                    = "town"
+	Village                 = "village"
+	Municipality            = "municipality"
+	County                  = "county"
+	State                   = "state"
+	Country                 = "country"
+)
 
 type Place struct {
-	LatLong
-	Name string
+	Type          PlaceType
+	Lat           float64
+	Lon           float64
+	Name          string
+	Neighbourhood string
+	Suburb        string
+	City          string
+	Town          string
+	Village       string
+	Municipality  string
+	County        string
+	State         string
+	Country       string
 }
 
-type PlaceFinder interface {
-	FromName(string) ([]Place, error)
-	FromLatLong(LatLong) ([]Place, error)
+type Finder interface {
+	Find(name string) ([]Place, error)
 }
