@@ -89,7 +89,7 @@ func New(userAgent string) (f places.Finder, err error) {
 }
 func (c *client) Find(name string) (results []places.Place, err error) {
 	results, err = dbQuery(c.db, name)
-	if len(results) != 0 || err != nil {
+	if len(results) != 0 || (err != sql.ErrNoRows && err != nil) {
 		return results, err
 	}
 	lock()
